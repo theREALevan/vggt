@@ -24,14 +24,37 @@ print(f"Device: {device}, AMP dtype: {dtype}")
 model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
 model.eval()
 
-# Load & preprocess images
-image_paths = sorted([
-    os.path.join(IMAGE_FOLDER, fn)
-    for fn in os.listdir(IMAGE_FOLDER)
-    if fn.lower().endswith(('.png','.jpg','.jpeg','.bmp','.tiff','.webp'))
-])
+# Load & preprocess images or video
+image_paths = []
+for fn in os.listdir(IMAGE_FOLDER):
+    if fn.lower().endswith(('.png','.jpg','.jpeg','.bmp','.tiff','.webp')):
+        image_paths.append(os.path.join(IMAGE_FOLDER, fn))
+    elif fn.lower().endswith('.mp4'):
+        # Handle video file
+        video_path = os.path.join(IMAGE_FOLDER, fn)
+        vs = cv2.VideoCapture(video_path)
+        fps = vs.get(cv2.CAP_PROP_FPS)
+        frame_interval = int(fps * 1)  # 1 frame per second
+        
+        count = 0
+        video_frame_num = 0
+        while True:
+            gotit, frame = vs.read()
+            if not gotit:
+                break
+            count += 1
+            if count % frame_interval == 0:
+                frame_path = os.path.join(IMAGE_FOLDER, f"frame_{video_frame_num:06d}.png")
+                cv2.imwrite(frame_path, frame)
+                image_paths.append(frame_path)
+                video_frame_num += 1
+        vs.release()
+
 if not image_paths:
-    raise RuntimeError(f"No images found in {IMAGE_FOLDER}")
+    raise RuntimeError(f"No images or video found in {IMAGE_FOLDER}")
+
+# Sort paths to ensure consistent ordering
+image_paths = sorted(image_paths)
 
 images = load_and_preprocess_images(image_paths).to(device)
 H, W = images.shape[-2:]
