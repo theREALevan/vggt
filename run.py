@@ -7,6 +7,25 @@ from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from visual_util import predictions_to_glb
+from PIL import Image
+try:
+    import pillow_heif
+except ImportError:
+    print("Not supporting HEIC files")
+
+def convert_heic_to_pil(heic_path):
+    # Convert HEIC image to PIL Image.
+    try:
+        heif_file = pillow_heif.read_heif(heic_path)
+        image = Image.frombytes(
+            heif_file.mode,
+            heif_file.size,
+            heif_file.data,
+            "raw",
+        )
+        return image
+    except NameError:
+        raise ImportError("pillow-heif is required")
 
 # Configuration
 IMAGE_FOLDER = '/home/yz864/vggt/images'   # folder of input images
@@ -27,8 +46,21 @@ model.eval()
 # Load & preprocess images or video
 image_paths = []
 for fn in os.listdir(IMAGE_FOLDER):
-    if fn.lower().endswith(('.png','.jpg','.jpeg','.bmp','.tiff','.webp')):
-        image_paths.append(os.path.join(IMAGE_FOLDER, fn))
+    file_path = os.path.join(IMAGE_FOLDER, fn)
+    if fn.lower().endswith('.heic'):
+        # Convert HEIC to PNG
+        try:
+            png_path = os.path.splitext(file_path)[0] + '.png'
+            heic_image = convert_heic_to_pil(file_path)
+            heic_image.save(png_path, 'PNG')
+            image_paths.append(png_path)
+            print(f"Converted {fn} to PNG")
+        except ImportError as e:
+            print(f"Skipping {fn}: {str(e)}")
+        except Exception as e:
+            print(f"Error converting {fn}: {str(e)}")
+    elif fn.lower().endswith(('.png','.jpg','.jpeg','.bmp','.tiff','.webp')):
+        image_paths.append(file_path)
     elif fn.lower().endswith('.mp4'):
         # Handle video file
         video_path = os.path.join(IMAGE_FOLDER, fn)
