@@ -120,7 +120,7 @@ def main():
     model.eval()
     
     # Load sELP test set
-    test_data = np.load('/home/yz864/vggt/metadata/selp_test_set.npy', allow_pickle=True).item()
+    test_data = np.load('metadata/selp_test_set.npy', allow_pickle=True).item()
     
     errors_by_overlap = {
         'large': [],
@@ -134,8 +134,8 @@ def main():
         overlap_amount = pair_data['overlap_amount'].lower()
         
         # Get image paths
-        img1_path = os.path.join('/home/yz864/vggt/metadata/images_to_npys/test_scenes_images/selp', pair_data['img1']['path'])
-        img2_path = os.path.join('/home/yz864/vggt/metadata/images_to_npys/test_scenes_images/selp', pair_data['img2']['path'])
+        img1_path = os.path.join('metadata/images_to_npys/test_scenes_images/selp', pair_data['img1']['path'])
+        img2_path = os.path.join('metadata/images_to_npys/test_scenes_images/selp', pair_data['img2']['path'])
         
         gt_R1 = quaternion_to_rotation_matrix(
             torch.tensor(pair_data['img1']['qw'], device=device),
