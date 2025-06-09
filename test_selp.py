@@ -69,18 +69,17 @@ def evaluate_pair(model, img1_path, img2_path, gt_R1, gt_R2, device, dtype):
     # Run inference on the batch
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
-            predictions = model(images)
+            images = images[None]  # add batch dimension
+            aggregated_tokens_list, ps_idx = model.aggregator(images)
+            
+            # Predict Cameras
+            pose_enc = model.camera_head(aggregated_tokens_list)[-1]
+            # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
     
-    # Get predicted rotations
-    extrinsic_t, _ = pose_encoding_to_extri_intri(
-        predictions["pose_enc"],     # shape (1, S, 9)
-        image_size_hw=(H, W)
-    )
-    extrinsic_t = extrinsic_t.squeeze(0)  # Remove batch dimension, (S, 3, 4)
-    
-    # Extract rotation matrices
-    pred_R1 = extrinsic_t[0, :3, :3]
-    pred_R2 = extrinsic_t[1, :3, :3]
+    # Extract rotation matrices from extrinsic matrices
+    pred_R1 = extrinsic[0, 0, :3, :3]  # First image rotation
+    pred_R2 = extrinsic[0, 1, :3, :3]  # Second image rotation
     
     # Compute relative rotations
     pred_rel_R = torch.mm(pred_R2, pred_R1.transpose(0, 1))
@@ -92,7 +91,7 @@ def evaluate_pair(model, img1_path, img2_path, gt_R1, gt_R2, device, dtype):
         gt_rel_R.unsqueeze(0)
     )
     
-    return error.item() * 180 / np.pi
+    return error.item() * 180 / np.pi, pred_rel_R.cpu().numpy(), gt_rel_R.cpu().numpy()
 
 def print_metrics(errors, category):
     """Print metrics for a given category of errors."""
@@ -128,10 +127,27 @@ def main():
         'none': []
     }
     
+    # Track pairs for visualization
+    viz_pairs = {
+        'large': {'small': [], 'medium': [], 'large': []},
+        'small': {'small': [], 'medium': [], 'large': []},
+        'none': {'small': [], 'medium': [], 'large': []}
+    }
+    
+    # Track scenes to ensure diversity
+    scene_counts = {
+        'large': {'small': {}, 'medium': {}, 'large': {}},
+        'small': {'small': {}, 'medium': {}, 'large': {}},
+        'none': {'small': {}, 'medium': {}, 'large': {}}
+    }
+    
     # Process all pairs
     for idx in tqdm(test_data.keys()):
         pair_data = test_data[idx]
         overlap_amount = pair_data['overlap_amount'].lower()
+        
+        # Get scene ID from image paths
+        scene_id = pair_data['img1']['path'].split('/')[0]
         
         # Get image paths
         img1_path = os.path.join('metadata/images_to_npys/test_scenes_images/selp', pair_data['img1']['path'])
@@ -151,8 +167,55 @@ def main():
             torch.tensor(pair_data['img2']['qz'], device=device)
         )
         
-        error = evaluate_pair(model, img1_path, img2_path, gt_R1, gt_R2, device, dtype)
+        error, pred_rel_R, gt_rel_R = evaluate_pair(model, img1_path, img2_path, gt_R1, gt_R2, device, dtype)
         errors_by_overlap[overlap_amount].append(error)
+        
+        # Track pairs for visualization with scene diversity
+        def can_add_pair(error_range):
+            # Check if already have 10 pairs for this error range
+            if len(viz_pairs[overlap_amount][error_range]) >= 10:
+                return False
+            
+            # Check if already have too many pairs from this scene
+            if scene_counts[overlap_amount][error_range].get(scene_id, 0) >= 2:
+                return False
+            
+            return True
+        
+        # Add pair if it meets the criteria
+        if error <= 15 and can_add_pair('small'):
+            viz_pairs[overlap_amount]['small'].append({
+                'idx': idx,
+                'error': error,
+                'scene_id': scene_id,
+                'img1_path': pair_data['img1']['path'],
+                'img2_path': pair_data['img2']['path'],
+                'pred_rel_R': pred_rel_R,
+                'gt_rel_R': gt_rel_R
+            })
+            scene_counts[overlap_amount]['small'][scene_id] = scene_counts[overlap_amount]['small'].get(scene_id, 0) + 1
+        elif 15 < error <= 30 and can_add_pair('medium'):
+            viz_pairs[overlap_amount]['medium'].append({
+                'idx': idx,
+                'error': error,
+                'scene_id': scene_id,
+                'img1_path': pair_data['img1']['path'],
+                'img2_path': pair_data['img2']['path'],
+                'pred_rel_R': pred_rel_R,
+                'gt_rel_R': gt_rel_R
+            })
+            scene_counts[overlap_amount]['medium'][scene_id] = scene_counts[overlap_amount]['medium'].get(scene_id, 0) + 1
+        elif 30 < error <= 150 and can_add_pair('large'):
+            viz_pairs[overlap_amount]['large'].append({
+                'idx': idx,
+                'error': error,
+                'scene_id': scene_id,
+                'img1_path': pair_data['img1']['path'],
+                'img2_path': pair_data['img2']['path'],
+                'pred_rel_R': pred_rel_R,
+                'gt_rel_R': gt_rel_R
+            })
+            scene_counts[overlap_amount]['large'][scene_id] = scene_counts[overlap_amount]['large'].get(scene_id, 0) + 1
         
         # Print progress every 100 pairs
         total_processed = sum(len(errors) for errors in errors_by_overlap.values())
@@ -161,6 +224,29 @@ def main():
             for overlap in errors_by_overlap:
                 if errors_by_overlap[overlap]:
                     print_metrics(errors_by_overlap[overlap], overlap)
+    
+    # Save viz_pairs data immediately after testing
+    print("\nSaving visualization pairs data...")
+    
+    # Print summary of saved visualization pairs
+    print("\nVisualization Pairs Summary:")
+    print("============================")
+    for overlap in ['large', 'small', 'none']:
+        print(f"\n{overlap.upper()} overlap:")
+        print("-" * 20)
+        for error_range in ['small', 'medium', 'large']:
+            pairs = viz_pairs[overlap][error_range]
+            scenes = set(pair['scene_id'] for pair in pairs)
+            errors = [pair['error'] for pair in pairs]
+            print(f"{error_range} error range (≤15°, 15-30°, 30-150°):")
+            print(f"  - Number of pairs: {len(pairs)}")
+            print(f"  - Number of unique scenes: {len(scenes)}")
+            print(f"  - Scenes: {', '.join(sorted(scenes))}")
+            print(f"  - Error range: {min(errors):.2f}° to {max(errors):.2f}°")
+            print(f"  - Mean error: {np.mean(errors):.2f}°")
+    
+    np.save('selp_viz_pairs.npy', viz_pairs)
+    print("\nSaved selp_viz_pairs.npy")
     
     # Final results
     print("\n=== Final Results ===")
