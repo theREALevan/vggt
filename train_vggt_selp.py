@@ -387,7 +387,9 @@ def main():
     # Create datasets - combine both overlap and none-overlap data
     print("\nLoading datasets...")
     train_none = MegaScenesDataset('metadata/train_none_megascenes_path.npy', mode="pad")
+    train_overlap = MegaScenesDataset('metadata/train_overlap_megascenes_path.npy', mode="pad")
     print(f"Loaded non-overlap dataset with {len(train_none)} samples")
+    print(f"Loaded overlap dataset with {len(train_overlap)} samples")
     
     # Create data loaders with optimized settings
     train_none_loader = DataLoader(
@@ -402,7 +404,21 @@ def main():
         drop_last=True,
         generator=torch.Generator().manual_seed(42)
     )
-    print(f"Created data loader with {len(train_none_loader)} batches")
+    
+    train_overlap_loader = DataLoader(
+        train_overlap,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=custom_collate_fn,
+        pin_memory=pin_memory,
+        persistent_workers=True,
+        prefetch_factor=prefetch_factor,
+        drop_last=True,
+        generator=torch.Generator().manual_seed(43)
+    )
+    
+    print(f"Created data loaders with {len(train_none_loader)} batches for non-overlap and {len(train_overlap_loader)} batches for overlap")
     
     # Initialize optimizer and scaler
     print("\nInitializing optimizer and scaler...")
@@ -417,11 +433,17 @@ def main():
         print(f"Epoch {epoch+1}/{num_epochs}")
         print(f"{'='*50}")
         
-        # Train on non-overlap data
-        none_loss = train_epoch(model, train_none_loader, optimizer, scaler, device, accumulation_steps)
+        # Alternate between overlap and non-overlap data
+        if epoch % 2 == 0:
+            print("\nTraining on non-overlap data...")
+            none_loss = train_epoch(model, train_none_loader, optimizer, scaler, device, accumulation_steps)
+            print(f"Non-overlap Loss: {none_loss:.4f}")
+        else:
+            print("\nTraining on overlap data...")
+            overlap_loss = train_epoch(model, train_overlap_loader, optimizer, scaler, device, accumulation_steps)
+            print(f"Overlap Loss: {overlap_loss:.4f}")
         
         print(f"\nEpoch {epoch+1}/{num_epochs} completed")
-        print(f"Non-overlap Loss: {none_loss:.4f}")
         
         # Save checkpoint
         if (epoch + 1) % 10 == 0:
@@ -430,9 +452,9 @@ def main():
                 'epoch': epoch,
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'none_loss': none_loss,
+                'none_loss': none_loss if epoch % 2 == 0 else overlap_loss,
             }
-            torch.save(checkpoint, f'vggt_megascenes_none_checkpoint_epoch{epoch+1}.pth')
+            torch.save(checkpoint, f'vggt_megascenes_checkpoint_epoch{epoch+1}.pth')
             print("Checkpoint saved successfully")
             
         # Clear cache after each epoch
