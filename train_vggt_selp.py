@@ -113,9 +113,62 @@ class MegaScenesDataset(Dataset):
         with open(categories_json, 'r') as f:
             cat_map = json.load(f)
         self.sceneid_to_category = {int(v): k for k, v in cat_map.items()}
+        
+        # Pre-compute valid paths and store minimal data
+        self.valid_pairs = []
+        # Debug counters
+        total_pairs = len(self.keys)
+        invalid_path_format = 0
+        missing_category = 0
+        missing_images = 0
+        
+        for idx, key in enumerate(self.keys):
+            pair_data = self.data[key]
+            img1_path = self.get_img_path(pair_data['img1']['path'])
+            img2_path = self.get_img_path(pair_data['img2']['path'])
+            
+            # Track why pairs are being filtered
+            if img1_path is None or img2_path is None:
+                if not pair_data['img1']['path'].startswith('images/') or not pair_data['img2']['path'].startswith('images/'):
+                    invalid_path_format += 1
+                else:
+                    parts1 = pair_data['img1']['path'].split('/')
+                    parts2 = pair_data['img2']['path'].split('/')
+                    scene_id1 = int(parts1[1] + parts1[2])
+                    scene_id2 = int(parts2[1] + parts2[2])
+                    if self.sceneid_to_category.get(scene_id1) is None or self.sceneid_to_category.get(scene_id2) is None:
+                        missing_category += 1
+                    else:
+                        missing_images += 1
+                continue
+                
+            # Store only necessary data
+            self.valid_pairs.append({
+                'idx': idx,
+                'img1_path': img1_path,
+                'img2_path': img2_path,
+                'overlap_amount': pair_data['overlap_amount'],
+                'img1_quat': [pair_data['img1']['qw'], pair_data['img1']['qx'], 
+                            pair_data['img1']['qy'], pair_data['img1']['qz']],
+                'img2_quat': [pair_data['img2']['qw'], pair_data['img2']['qx'], 
+                            pair_data['img2']['qy'], pair_data['img2']['qz']]
+            })
+            
+        print(f"\nDataset filtering statistics:")
+        print(f"Total pairs in file: {total_pairs}")
+        print(f"Valid pairs found: {len(self.valid_pairs)}")
+        print(f"Pairs filtered out: {total_pairs - len(self.valid_pairs)}")
+        print(f"  - Invalid path format: {invalid_path_format}")
+        print(f"  - Missing category mapping: {missing_category}")
+        print(f"  - Missing image files: {missing_images}")
+        
+        # Clear the original data to free memory
+        del self.data
+        import gc
+        gc.collect()
 
     def __len__(self):
-        return len(self.keys)
+        return len(self.valid_pairs)
 
     def get_img_path(self, img_path):
         parts = img_path.split('/')
@@ -134,60 +187,56 @@ class MegaScenesDataset(Dataset):
             return None
 
     def __getitem__(self, idx):
-        max_attempts = len(self)  # Maximum number of attempts to find valid pair
-        attempts = 0
+        pair_data = self.valid_pairs[idx]
         
-        while attempts < max_attempts:
-            pair_data = self.data[self.keys[idx]]
-            img1_path = self.get_img_path(pair_data['img1']['path'])
-            img2_path = self.get_img_path(pair_data['img2']['path'])
-
-            # If either image is missing, try the next index
-            if img1_path is None or img2_path is None:
-                idx = (idx + 1) % len(self)
-                attempts += 1
-                continue
-
-            # Load and preprocess images with specified mode
-            images = load_and_preprocess_images([img1_path, img2_path], mode=self.mode)
-            
-            # Convert quaternions to rotation matrices for both images
-            gt_R1 = quaternion_to_rotation_matrix(
-                torch.tensor(pair_data['img1']['qw']),
-                torch.tensor(pair_data['img1']['qx']),
-                torch.tensor(pair_data['img1']['qy']),
-                torch.tensor(pair_data['img1']['qz'])
-            )
-            
-            gt_R2 = quaternion_to_rotation_matrix(
-                torch.tensor(pair_data['img2']['qw']),
-                torch.tensor(pair_data['img2']['qx']),
-                torch.tensor(pair_data['img2']['qy']),
-                torch.tensor(pair_data['img2']['qz'])
-            )
-            
-            # Stack rotations
-            gt_rotation = torch.stack([gt_R1, gt_R2], dim=0)
-            
-            return {
-                'images': images,  # [2, 3, H, W]
-                'rotation': gt_rotation,  # [2, 3, 3]
-                'overlap_amount': pair_data['overlap_amount']
-            }
+        # Load and preprocess images sequentially
+        img1 = load_and_preprocess_images([pair_data['img1_path']], mode=self.mode)[0]  # [3, H, W]
+        img2 = load_and_preprocess_images([pair_data['img2_path']], mode=self.mode)[0]  # [3, H, W]
         
-        raise RuntimeError("No valid image pairs found in dataset after checking all samples!")
+        # Convert quaternions to rotation matrices
+        gt_R1 = quaternion_to_rotation_matrix(
+            torch.tensor(pair_data['img1_quat'][0]),
+            torch.tensor(pair_data['img1_quat'][1]),
+            torch.tensor(pair_data['img1_quat'][2]),
+            torch.tensor(pair_data['img1_quat'][3])
+        )
+        
+        gt_R2 = quaternion_to_rotation_matrix(
+            torch.tensor(pair_data['img2_quat'][0]),
+            torch.tensor(pair_data['img2_quat'][1]),
+            torch.tensor(pair_data['img2_quat'][2]),
+            torch.tensor(pair_data['img2_quat'][3])
+        )
+        
+        # Stack rotations
+        gt_rotation = torch.stack([gt_R1, gt_R2], dim=0)
+        
+        return {
+            'img1': img1,  # [3, H, W]
+            'img2': img2,  # [3, H, W]
+            'rotation': gt_rotation,  # [2, 3, 3]
+            'overlap_amount': pair_data['overlap_amount']
+        }
 
 def custom_collate_fn(batch):
-    # batch is a list of dicts
-    images = [item['images'] for item in batch]
+    # Extract and stack images
+    img1_list = [item['img1'] for item in batch]
+    img2_list = [item['img2'] for item in batch]
     rotations = [item['rotation'] for item in batch]
     overlap_amounts = [item['overlap_amount'] for item in batch]
     
-    # Stack images into a single tensor
-    images = torch.stack(images)  # [B, 2, 3, H, W]
+    # Stack images into tensors
+    img1_batch = torch.stack(img1_list)  # [B, 3, H, W]
+    img2_batch = torch.stack(img2_list)  # [B, 3, H, W]
+    images = torch.stack([img1_batch, img2_batch], dim=1)  # [B, 2, 3, H, W]
     
-    # Stack rotations into a single tensor
+    # Stack rotations
     rotations = torch.stack(rotations)  # [B, 2, 3, 3]
+    
+    # Clear lists to free memory
+    del img1_list, img2_list
+    import gc
+    gc.collect()
     
     return {
         'images': images,  # [B, 2, 3, H, W] tensor
@@ -222,6 +271,13 @@ def train_epoch(model, dataloader, optimizer, scaler, device, accumulation_steps
     for batch_idx, batch in enumerate(pbar):
         batch_loss = None
         try:
+            # Print memory before data loading
+            # print(f"\nData loading memory - Batch {batch_idx}:")
+            # print_gpu_memory()
+            
+            # Clear cache before processing each batch
+            torch.cuda.empty_cache()
+            
             images = batch['images'].to(device)  # [B, 2, 3, H, W]
             gt_rotation = batch['rotation'].to(device)  # [B, 2, 3, 3]
             H, W = images.shape[-2:]
@@ -241,11 +297,17 @@ def train_epoch(model, dataloader, optimizer, scaler, device, accumulation_steps
             # Backward pass with gradient scaling
             scaler.scale(batch_loss).backward()
             
+            # Print training memory after forward/backward
+            # print(f"Training memory - Batch {batch_idx}:")
+            # print_gpu_memory()
+            
             # Update weights every accumulation_steps
             if (batch_idx + 1) % accumulation_steps == 0:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                # Clear cache after optimizer step
+                torch.cuda.empty_cache()
             
             # Clear memory
             del images, gt_rotation, aggregated_tokens_list, ps_idx, pose_enc
@@ -275,11 +337,13 @@ def train_epoch(model, dataloader, optimizer, scaler, device, accumulation_steps
 def main():
     # Configuration
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    batch_size = 8
+    batch_size = 4
     num_epochs = 50
     learning_rate = 1e-4
-    accumulation_steps = 4 
-    num_workers = 8
+    accumulation_steps = 8
+    num_workers = 2
+    prefetch_factor = 2
+    pin_memory = True
     
     print("\nInitializing training...")
     print(f"Device: {device}")
@@ -289,7 +353,8 @@ def main():
     print(f"Learning rate: {learning_rate}")
     print(f"Number of epochs: {num_epochs}")
     print(f"Number of workers: {num_workers}")
-    # print_gpu_memory()
+    print(f"Prefetch factor: {prefetch_factor}")
+    print(f"Pin memory: {pin_memory}")
     
     # Initialize model
     print("\nLoading VGGT model...")
@@ -303,8 +368,6 @@ def main():
     print(f"Trainable parameters: {trainable_params:,}")
     print(f"Non-trainable parameters: {total_params - trainable_params:,}")
     
-    # print_gpu_memory()
-    
     # Enable gradient checkpointing for transformer blocks
     print("\nEnabling gradient checkpointing...")
     checkpoint_count = 0
@@ -314,41 +377,38 @@ def main():
             module.use_reentrant = False
             checkpoint_count += 1
     print(f"Enabled checkpointing for {checkpoint_count} modules")
-    # print_gpu_memory()
     
-    # Disable heads we don't need for pose estimation
-    print("\nDisabling unused model heads...")
-    model.point_head = None  # Disable point head
-    model.depth_head = None  # Disable depth head
-    model.track_head = None  # Disable track head
-    print("Unused heads disabled")
-    # print_gpu_memory()
+    # Enable memory efficient attention if available
+    if hasattr(model, 'enable_memory_efficient_attention'):
+        print("\nEnabling memory efficient attention...")
+        model.enable_memory_efficient_attention()
+        print("Memory efficient attention enabled")
     
     # Create datasets - combine both overlap and none-overlap data
     print("\nLoading datasets...")
-    train_overlap = MegaScenesDataset('metadata/train_overlap_megascenes_path.npy', mode="pad")
-    print(f"Loaded overlap dataset with {len(train_overlap)} samples")
+    train_none = MegaScenesDataset('metadata/train_none_megascenes_path.npy', mode="pad")
+    print(f"Loaded non-overlap dataset with {len(train_none)} samples")
     
-    # Create data loaders with custom collate_fn and memory pinning
-    train_overlap_loader = DataLoader(
-        train_overlap, 
+    # Create data loaders with optimized settings
+    train_none_loader = DataLoader(
+        train_none, 
         batch_size=batch_size, 
         shuffle=True, 
         num_workers=num_workers, 
         collate_fn=custom_collate_fn,
-        pin_memory=True,
+        pin_memory=pin_memory,
         persistent_workers=True,
-        prefetch_factor=2
+        prefetch_factor=prefetch_factor,
+        drop_last=True,
+        generator=torch.Generator().manual_seed(42)
     )
-    print(f"Created data loader with {len(train_overlap_loader)} batches")
-    # print_gpu_memory()
+    print(f"Created data loader with {len(train_none_loader)} batches")
     
     # Initialize optimizer and scaler
     print("\nInitializing optimizer and scaler...")
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.05)
     scaler = GradScaler()
     print("Optimizer and scaler initialized")
-    # print_gpu_memory()
     
     # Training loop
     print("\nStarting training...")
@@ -356,27 +416,27 @@ def main():
         print(f"\n{'='*50}")
         print(f"Epoch {epoch+1}/{num_epochs}")
         print(f"{'='*50}")
-        # print_gpu_memory()
         
-        # Train on overlap data
-        overlap_loss = train_epoch(model, train_overlap_loader, optimizer, scaler, device, accumulation_steps)
+        # Train on non-overlap data
+        none_loss = train_epoch(model, train_none_loader, optimizer, scaler, device, accumulation_steps)
         
         print(f"\nEpoch {epoch+1}/{num_epochs} completed")
-        print(f"Overlap Loss: {overlap_loss:.4f}")
-        # print_gpu_memory()
+        print(f"Non-overlap Loss: {none_loss:.4f}")
         
         # Save checkpoint
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 10 == 0:
             print(f"\nSaving checkpoint for epoch {epoch+1}...")
             checkpoint = {
                 'epoch': epoch,
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'overlap_loss': overlap_loss,
+                'none_loss': none_loss,
             }
-            torch.save(checkpoint, f'vggt_megascenes_checkpoint_epoch{epoch+1}.pth')
+            torch.save(checkpoint, f'vggt_megascenes_none_checkpoint_epoch{epoch+1}.pth')
             print("Checkpoint saved successfully")
-            # print_gpu_memory()
+            
+        # Clear cache after each epoch
+        torch.cuda.empty_cache()
 
 if __name__ == '__main__':
     main()
