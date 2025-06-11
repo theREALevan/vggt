@@ -1,7 +1,7 @@
 import os
 import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from vggt.models.vggt import VGGT
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
@@ -92,8 +92,18 @@ def compute_rotation_loss(pose_enc, gt_rotation, image_size_hw):
     pred_rel_R = torch.bmm(pred_R2, pred_R1.transpose(1, 2))
     gt_rel_R = torch.bmm(gt_R2, gt_R1.transpose(1, 2))
     
-    # Compute geodesic error
-    error = compute_geodesic_distance_from_two_matrices(pred_rel_R, gt_rel_R)
+    # Add numerical stability to rotation matrices
+    pred_rel_R = pred_rel_R / (torch.norm(pred_rel_R, dim=(1, 2), keepdim=True) + 1e-8)
+    gt_rel_R = gt_rel_R / (torch.norm(gt_rel_R, dim=(1, 2), keepdim=True) + 1e-8)
+    
+    # Compute geodesic error with numerical stability
+    m = torch.bmm(pred_rel_R.to(torch.float64), gt_rel_R.to(torch.float64).transpose(1, 2))
+    cos = (m[:, 0, 0] + m[:, 1, 1] + m[:, 2, 2] - 1) / 2
+    cos = torch.clamp(cos, min=-1.0, max=1.0)
+    theta = torch.acos(cos)
+    
+    # Add small epsilon to prevent zero gradients
+    error = theta + 1e-8
     
     return error.mean()
 
@@ -256,10 +266,14 @@ def print_gpu_memory():
         print(f"Max Memory: {max_memory:.1f}MB")
         print(f"Free:      {max_memory - allocated:.1f}MB")
 
-def train_epoch(model, dataloader, optimizer, scaler, device, accumulation_steps=4):
+def train_epoch(model, dataloader, optimizer, scaler, device, accumulation_steps=4, epoch=0):
     model.train()
     total_loss = 0
     optimizer.zero_grad()
+    
+    # Track parameter updates
+    param_updates = {name: 0.0 for name, _ in model.named_parameters() if _.requires_grad}
+    grad_norms = {name: 0.0 for name, _ in model.named_parameters() if _.requires_grad}
     
     print(f"\nStarting epoch with {len(dataloader)} batches")
     print(f"Batch size: {dataloader.batch_size}, Accumulation steps: {accumulation_steps}")
@@ -268,18 +282,19 @@ def train_epoch(model, dataloader, optimizer, scaler, device, accumulation_steps
 
     pbar = tqdm(dataloader, desc="Training", leave=True)
     
+    # Warmup period for non-overlap data (first 5 epochs)
+    warmup_epochs = 5
+    non_overlap_weight = min(1.0, epoch / warmup_epochs)
+    
     for batch_idx, batch in enumerate(pbar):
         batch_loss = None
         try:
-            # Print memory before data loading
-            # print(f"\nData loading memory - Batch {batch_idx}:")
-            # print_gpu_memory()
-            
             # Clear cache before processing each batch
             torch.cuda.empty_cache()
             
             images = batch['images'].to(device)  # [B, 2, 3, H, W]
             gt_rotation = batch['rotation'].to(device)  # [B, 2, 3, 3]
+            overlap_amounts = batch['overlap_amount']  # List of overlap amounts
             H, W = images.shape[-2:]
             
             # Forward pass with mixed precision
@@ -292,20 +307,50 @@ def train_epoch(model, dataloader, optimizer, scaler, device, accumulation_steps
                 
                 # Compute geodesic loss
                 batch_loss = compute_rotation_loss(pose_enc, gt_rotation, image_size_hw=(H, W))
+                
+                # Apply loss weighting based on overlap amount
+                weights = torch.tensor([1.0 if overlap.lower() != 'none' else non_overlap_weight for overlap in overlap_amounts], 
+                                    device=device)
+                batch_loss = (batch_loss * weights).mean()
+                
+                # Check for NaN loss
+                if torch.isnan(batch_loss):
+                    print(f"\nWARNING: NaN loss detected in batch {batch_idx}")
+                    print(f"Batch data shapes: images {images.shape}, gt_rotation {gt_rotation.shape}")
+                    print(f"Pose encoding shape: {pose_enc.shape}")
+                    print(f"Pose encoding stats: min={pose_enc.min().item():.4f}, max={pose_enc.max().item():.4f}, mean={pose_enc.mean().item():.4f}")
+                    print(f"GT rotation stats: min={gt_rotation.min().item():.4f}, max={gt_rotation.max().item():.4f}, mean={gt_rotation.mean().item():.4f}")
+                    raise RuntimeError("NaN loss detected")
+                
                 batch_loss = batch_loss / accumulation_steps  # Normalize loss for gradient accumulation
             
             # Backward pass with gradient scaling
             scaler.scale(batch_loss).backward()
             
-            # Print training memory after forward/backward
-            # print(f"Training memory - Batch {batch_idx}:")
-            # print_gpu_memory()
-            
             # Update weights every accumulation_steps
             if (batch_idx + 1) % accumulation_steps == 0:
+                # Clip gradients to prevent exploding gradients
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # Track gradients before update
+                for name, param in model.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        grad_norms[name] = param.grad.norm().item()
+                
+                # Store parameter values before update
+                old_params = {name: param.data.clone() for name, param in model.named_parameters() if param.requires_grad}
+                
+                # Update parameters
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                
+                # Calculate parameter updates
+                for name, param in model.named_parameters():
+                    if param.requires_grad:
+                        param_updates[name] += (param.data - old_params[name]).norm().item()
+                
                 # Clear cache after optimizer step
                 torch.cuda.empty_cache()
             
@@ -316,11 +361,25 @@ def train_epoch(model, dataloader, optimizer, scaler, device, accumulation_steps
             if batch_loss is not None:  # Only update total_loss if batch_loss was computed
                 total_loss += batch_loss.item() * accumulation_steps  # Scale loss back up for reporting
                 
-                pbar.set_postfix({
-                    'loss': f'{batch_loss.item() * accumulation_steps:.4f}',
-                    'avg_loss': f'{total_loss / (batch_idx + 1):.4f}',
-                    'memory': f'{torch.cuda.memory_allocated() / 1024**2:.1f}MB'
-                })
+                # Add gradient and update info to progress bar
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    avg_grad_norm = sum(grad_norms.values()) / len(grad_norms)
+                    avg_param_update = sum(param_updates.values()) / len(param_updates)
+                    pbar.set_postfix({
+                        'loss': f'{batch_loss.item() * accumulation_steps:.4f}',
+                        'avg_loss': f'{total_loss / (batch_idx + 1):.4f}',
+                        'grad_norm': f'{avg_grad_norm:.4f}',
+                        'param_update': f'{avg_param_update:.4f}',
+                        'memory': f'{torch.cuda.memory_allocated() / 1024**2:.1f}MB',
+                        'non_overlap_weight': f'{non_overlap_weight:.2f}'
+                    })
+                else:
+                    pbar.set_postfix({
+                        'loss': f'{batch_loss.item() * accumulation_steps:.4f}',
+                        'avg_loss': f'{total_loss / (batch_idx + 1):.4f}',
+                        'memory': f'{torch.cuda.memory_allocated() / 1024**2:.1f}MB',
+                        'non_overlap_weight': f'{non_overlap_weight:.2f}'
+                    })
             
         except RuntimeError as e:
             if "out of memory" in str(e):
@@ -384,16 +443,20 @@ def main():
         model.enable_memory_efficient_attention()
         print("Memory efficient attention enabled")
     
-    # Create datasets - combine both overlap and none-overlap data
-    print("\nLoading datasets...")
+    # Create combined dataset
+    print("\nLoading and combining datasets...")
     train_none = MegaScenesDataset('metadata/train_none_megascenes_path.npy', mode="pad")
     train_overlap = MegaScenesDataset('metadata/train_overlap_megascenes_path.npy', mode="pad")
-    print(f"Loaded non-overlap dataset with {len(train_none)} samples")
-    print(f"Loaded overlap dataset with {len(train_overlap)} samples")
     
-    # Create data loaders with optimized settings
-    train_none_loader = DataLoader(
-        train_none, 
+    # Combine datasets
+    combined_dataset = ConcatDataset([train_none, train_overlap])
+    print(f"Combined dataset size: {len(combined_dataset)} samples")
+    print(f"  - Non-overlap samples: {len(train_none)}")
+    print(f"  - Overlap samples: {len(train_overlap)}")
+    
+    # Create data loader with optimized settings
+    train_loader = DataLoader(
+        combined_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
         num_workers=num_workers, 
@@ -405,26 +468,16 @@ def main():
         generator=torch.Generator().manual_seed(42)
     )
     
-    train_overlap_loader = DataLoader(
-        train_overlap,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=custom_collate_fn,
-        pin_memory=pin_memory,
-        persistent_workers=True,
-        prefetch_factor=prefetch_factor,
-        drop_last=True,
-        generator=torch.Generator().manual_seed(43)
-    )
-    
-    print(f"Created data loaders with {len(train_none_loader)} batches for non-overlap and {len(train_overlap_loader)} batches for overlap")
+    print(f"Created data loader with {len(train_loader)} batches")
     
     # Initialize optimizer and scaler
     print("\nInitializing optimizer and scaler...")
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.05)
     scaler = GradScaler()
     print("Optimizer and scaler initialized")
+    
+    # Initialize best loss tracking
+    best_loss = float('inf')
     
     # Training loop
     print("\nStarting training...")
@@ -433,28 +486,23 @@ def main():
         print(f"Epoch {epoch+1}/{num_epochs}")
         print(f"{'='*50}")
         
-        # Alternate between overlap and non-overlap data
-        if epoch % 2 == 0:
-            print("\nTraining on non-overlap data...")
-            none_loss = train_epoch(model, train_none_loader, optimizer, scaler, device, accumulation_steps)
-            print(f"Non-overlap Loss: {none_loss:.4f}")
-        else:
-            print("\nTraining on overlap data...")
-            overlap_loss = train_epoch(model, train_overlap_loader, optimizer, scaler, device, accumulation_steps)
-            print(f"Overlap Loss: {overlap_loss:.4f}")
-        
+        # Train on combined dataset
+        epoch_loss = train_epoch(model, train_loader, optimizer, scaler, device, accumulation_steps, epoch)
         print(f"\nEpoch {epoch+1}/{num_epochs} completed")
+        print(f"Loss: {epoch_loss:.4f}")
         
-        # Save checkpoint
-        if (epoch + 1) % 10 == 0:
-            print(f"\nSaving checkpoint for epoch {epoch+1}...")
+        # Save checkpoint if loss improved
+        if epoch_loss < best_loss:
+            print(f"\nNew best loss: {epoch_loss:.4f} (previous: {best_loss:.4f})")
+            best_loss = epoch_loss
+            print(f"Saving checkpoint for epoch {epoch+1}...")
             checkpoint = {
                 'epoch': epoch,
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'none_loss': none_loss if epoch % 2 == 0 else overlap_loss,
+                'best_loss': best_loss,
             }
-            torch.save(checkpoint, f'vggt_megascenes_checkpoint_epoch{epoch+1}.pth')
+            torch.save(checkpoint, f'vggt_megascenes_best.pth')
             print("Checkpoint saved successfully")
             
         # Clear cache after each epoch
