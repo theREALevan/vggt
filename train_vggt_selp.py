@@ -13,6 +13,11 @@ from tqdm import tqdm
 
 mp.set_start_method('spawn', force=True)
 
+def load_categories():
+    with open('categories.json', 'r') as f:
+        cat_map = json.load(f)
+    return {int(v): k for k, v in cat_map.items()}
+
 def compute_geodesic_distance_from_two_matrices(m1, m2):
     """Compute the geodesic distance between two rotation matrices."""
     batch = m1.shape[0]
@@ -80,32 +85,35 @@ def compute_rotation_loss(pose_enc, gt_rotation, image_size_hw):
         loss: Scalar tensor of geodesic error
     """
     # Convert pose encoding to rotation matrices
+    # 1. Decode into extrinsics [B,2,4,4]
     extrinsic_t, _ = pose_encoding_to_extri_intri(pose_enc, image_size_hw=image_size_hw)
-    pred_R1 = extrinsic_t[:, 0, :3, :3]  # First image rotation
-    pred_R2 = extrinsic_t[:, 1, :3, :3]  # Second image rotation
-    
-    # Extract ground truth rotations
-    gt_R1 = gt_rotation[:, 0]  # First image rotation
-    gt_R2 = gt_rotation[:, 1]  # Second image rotation
-    
-    # Compute relative rotations
-    pred_rel_R = torch.bmm(pred_R2, pred_R1.transpose(1, 2))
-    gt_rel_R = torch.bmm(gt_R2, gt_R1.transpose(1, 2))
-    
-    # Add numerical stability to rotation matrices
-    pred_rel_R = pred_rel_R / (torch.norm(pred_rel_R, dim=(1, 2), keepdim=True) + 1e-8)
-    gt_rel_R = gt_rel_R / (torch.norm(gt_rel_R, dim=(1, 2), keepdim=True) + 1e-8)
-    
-    # Compute geodesic error with numerical stability
-    m = torch.bmm(pred_rel_R.to(torch.float64), gt_rel_R.to(torch.float64).transpose(1, 2))
-    cos = (m[:, 0, 0] + m[:, 1, 1] + m[:, 2, 2] - 1) / 2
-    cos = torch.clamp(cos, min=-1.0, max=1.0)
-    theta = torch.acos(cos)
-    
-    # Add small epsilon to prevent zero gradients
-    error = theta + 1e-8
-    
-    return error.mean()
+    # 2. Extract rotations [B,3,3]
+    R1_pred, R2_pred = extrinsic_t[:,0,:3,:3], extrinsic_t[:,1,:3,:3]
+    R1_gt,   R2_gt   = gt_rotation[:,0],       gt_rotation[:,1]
+
+    # 3. Build relative rotations
+    R_rel_pred = torch.bmm(R2_pred, R1_pred.transpose(1,2))  # [B,3,3]
+    R_rel_gt   = torch.bmm(R2_gt,   R1_gt.transpose(1,2))    # [B,3,3]
+
+    # 4. Compute M = R_rel_pred @ R_rel_gt^T in double precision
+    M = torch.bmm(
+        R_rel_pred.to(torch.float64),
+        R_rel_gt.to(torch.float64).transpose(1,2)
+    )  # [B,3,3]
+
+    # 5. cos(theta) = (trace(M) - 1) / 2
+    trace = M[:,0,0] + M[:,1,1] + M[:,2,2]      # [B]
+    cos_theta = (trace - 1.0) / 2.0             # [B]
+
+    # 6. Clamp into [-1,1] exactly like compute_geodesic_distance
+    ones = torch.ones_like(cos_theta)
+    cos_theta = torch.min(cos_theta,  ones)
+    cos_theta = torch.max(cos_theta, -ones)
+
+    # 7. Surrogate loss = 1 - cos(theta)
+    loss = 1.0 - cos_theta.float()              # cast back to float32
+
+    return loss.mean()
 
 class MegaScenesDataset(Dataset):
     def __init__(self, data_path, base_paths=None, categories_json='categories.json', mode="pad"):
@@ -120,113 +128,89 @@ class MegaScenesDataset(Dataset):
         else:
             self.base_paths = base_paths
         self.keys = list(self.data.keys())
-        with open(categories_json, 'r') as f:
-            cat_map = json.load(f)
-        self.sceneid_to_category = {int(v): k for k, v in cat_map.items()}
         
-        # Pre-compute valid paths and store minimal data
-        self.valid_pairs = []
-        # Debug counters
-        total_pairs = len(self.keys)
-        invalid_path_format = 0
-        missing_category = 0
-        missing_images = 0
-        
-        for idx, key in enumerate(self.keys):
-            pair_data = self.data[key]
-            img1_path = self.get_img_path(pair_data['img1']['path'])
-            img2_path = self.get_img_path(pair_data['img2']['path'])
+        # Load categories mapping once
+        self.categories = load_categories()
             
-            # Track why pairs are being filtered
-            if img1_path is None or img2_path is None:
-                if not pair_data['img1']['path'].startswith('images/') or not pair_data['img2']['path'].startswith('images/'):
-                    invalid_path_format += 1
-                else:
-                    parts1 = pair_data['img1']['path'].split('/')
-                    parts2 = pair_data['img2']['path'].split('/')
-                    scene_id1 = int(parts1[1] + parts1[2])
-                    scene_id2 = int(parts2[1] + parts2[2])
-                    if self.sceneid_to_category.get(scene_id1) is None or self.sceneid_to_category.get(scene_id2) is None:
-                        missing_category += 1
-                    else:
-                        missing_images += 1
-                continue
-                
-            # Store only necessary data
-            self.valid_pairs.append({
-                'idx': idx,
-                'img1_path': img1_path,
-                'img2_path': img2_path,
-                'overlap_amount': pair_data['overlap_amount'],
-                'img1_quat': [pair_data['img1']['qw'], pair_data['img1']['qx'], 
-                            pair_data['img1']['qy'], pair_data['img1']['qz']],
-                'img2_quat': [pair_data['img2']['qw'], pair_data['img2']['qx'], 
-                            pair_data['img2']['qy'], pair_data['img2']['qz']]
-            })
-            
-        print(f"\nDataset filtering statistics:")
-        print(f"Total pairs in file: {total_pairs}")
-        print(f"Valid pairs found: {len(self.valid_pairs)}")
-        print(f"Pairs filtered out: {total_pairs - len(self.valid_pairs)}")
-        print(f"  - Invalid path format: {invalid_path_format}")
-        print(f"  - Missing category mapping: {missing_category}")
-        print(f"  - Missing image files: {missing_images}")
-        
-        # Clear the original data to free memory
-        del self.data
-        import gc
-        gc.collect()
+        print(f"\nDataset initialized with {len(self.keys)} total pairs")
+        print(f"Images will be processed during training")
+        print(f"Invalid pairs will be skipped automatically")
 
     def __len__(self):
-        return len(self.valid_pairs)
+        return len(self.keys)
 
     def get_img_path(self, img_path):
         parts = img_path.split('/')
         if parts[0] == 'images':
-            scene_id = int(parts[1] + parts[2])
-            category = self.sceneid_to_category.get(scene_id)
-            if category is None:
-                return None
-            parts = [parts[0], category] + parts[3:]
-            for base in self.base_paths:
-                candidate = os.path.join(base, *parts)
-                if os.path.exists(candidate):
-                    return candidate
-            return None
-        else:
-            return None
+            if len(parts) >= 4 and 'commons' in parts:
+                commons_idx = parts.index('commons')
+                if commons_idx + 1 < len(parts):
+                    scene_id1 = parts[1]
+                    scene_id2 = parts[2]
+                    scene_name = parts[commons_idx + 1]
+                    
+                    # Use categories mapping
+                    scene_id = f"{scene_id1}{scene_id2}"
+                    if scene_id in self.categories:
+                        mapped_name = self.categories[scene_id]
+                        scene_name = mapped_name
+                    
+                    # Reconstruct the path using the mapped scene name
+                    new_parts = [parts[0], scene_name, 'commons', scene_name, '0', 'pictures', parts[-1]]
+                    
+                    for base in self.base_paths:
+                        candidate = os.path.join(base, *new_parts)
+                        if os.path.exists(candidate):
+                            return candidate
+        return None
 
     def __getitem__(self, idx):
-        pair_data = self.valid_pairs[idx]
+        # Try up to len(self) pairs to find a valid one
+        attempts = 0
+        while attempts < len(self):
+            pair_data = self.data[self.keys[idx]]
+            
+            # Get image paths
+            img1_path = self.get_img_path(pair_data['img1']['path'])
+            img2_path = self.get_img_path(pair_data['img2']['path'])
+            
+            # If both images exist, process and return them
+            if img1_path is not None and img2_path is not None:
+                # Load and preprocess images
+                img1 = load_and_preprocess_images([img1_path], mode=self.mode)[0]  # [3, H, W]
+                img2 = load_and_preprocess_images([img2_path], mode=self.mode)[0]  # [3, H, W]
+                
+                # Convert quaternions to rotation matrices
+                gt_R1 = quaternion_to_rotation_matrix(
+                    torch.tensor(pair_data['img1']['qw']),
+                    torch.tensor(pair_data['img1']['qx']),
+                    torch.tensor(pair_data['img1']['qy']),
+                    torch.tensor(pair_data['img1']['qz'])
+                )
+                
+                gt_R2 = quaternion_to_rotation_matrix(
+                    torch.tensor(pair_data['img2']['qw']),
+                    torch.tensor(pair_data['img2']['qx']),
+                    torch.tensor(pair_data['img2']['qy']),
+                    torch.tensor(pair_data['img2']['qz'])
+                )
+                
+                # Stack rotations
+                gt_rotation = torch.stack([gt_R1, gt_R2], dim=0)
+                
+                return {
+                    'img1': img1,  # [3, H, W]
+                    'img2': img2,  # [3, H, W]
+                    'rotation': gt_rotation,  # [2, 3, 3]
+                    'overlap_amount': pair_data['overlap_amount']
+                }
+            
+            # If images are missing, try the next index
+            idx = (idx + 1) % len(self)
+            attempts += 1
         
-        # Load and preprocess images sequentially
-        img1 = load_and_preprocess_images([pair_data['img1_path']], mode=self.mode)[0]  # [3, H, W]
-        img2 = load_and_preprocess_images([pair_data['img2_path']], mode=self.mode)[0]  # [3, H, W]
-        
-        # Convert quaternions to rotation matrices
-        gt_R1 = quaternion_to_rotation_matrix(
-            torch.tensor(pair_data['img1_quat'][0]),
-            torch.tensor(pair_data['img1_quat'][1]),
-            torch.tensor(pair_data['img1_quat'][2]),
-            torch.tensor(pair_data['img1_quat'][3])
-        )
-        
-        gt_R2 = quaternion_to_rotation_matrix(
-            torch.tensor(pair_data['img2_quat'][0]),
-            torch.tensor(pair_data['img2_quat'][1]),
-            torch.tensor(pair_data['img2_quat'][2]),
-            torch.tensor(pair_data['img2_quat'][3])
-        )
-        
-        # Stack rotations
-        gt_rotation = torch.stack([gt_R1, gt_R2], dim=0)
-        
-        return {
-            'img1': img1,  # [3, H, W]
-            'img2': img2,  # [3, H, W]
-            'rotation': gt_rotation,  # [2, 3, 3]
-            'overlap_amount': pair_data['overlap_amount']
-        }
+        # If we've tried all pairs and found none valid, raise an error
+        raise RuntimeError("No valid image pairs found in the dataset")
 
 def custom_collate_fn(batch):
     # Extract and stack images
@@ -274,6 +258,10 @@ def train_epoch(model, dataloader, optimizer, scaler, device, accumulation_steps
     # Track parameter updates
     param_updates = {name: 0.0 for name, _ in model.named_parameters() if _.requires_grad}
     grad_norms = {name: 0.0 for name, _ in model.named_parameters() if _.requires_grad}
+    
+    # Track skipped pairs
+    total_pairs = len(dataloader.dataset)
+    skipped_pairs = 0
     
     print(f"\nStarting epoch with {len(dataloader)} batches")
     print(f"Batch size: {dataloader.batch_size}, Accumulation steps: {accumulation_steps}")
@@ -371,14 +359,16 @@ def train_epoch(model, dataloader, optimizer, scaler, device, accumulation_steps
                         'grad_norm': f'{avg_grad_norm:.4f}',
                         'param_update': f'{avg_param_update:.4f}',
                         'memory': f'{torch.cuda.memory_allocated() / 1024**2:.1f}MB',
-                        'non_overlap_weight': f'{non_overlap_weight:.2f}'
+                        'non_overlap_weight': f'{non_overlap_weight:.2f}',
+                        'skipped': f'{skipped_pairs}'
                     })
                 else:
                     pbar.set_postfix({
                         'loss': f'{batch_loss.item() * accumulation_steps:.4f}',
                         'avg_loss': f'{total_loss / (batch_idx + 1):.4f}',
                         'memory': f'{torch.cuda.memory_allocated() / 1024**2:.1f}MB',
-                        'non_overlap_weight': f'{non_overlap_weight:.2f}'
+                        'non_overlap_weight': f'{non_overlap_weight:.2f}',
+                        'skipped': f'{skipped_pairs}'
                     })
             
         except RuntimeError as e:
@@ -387,9 +377,16 @@ def train_epoch(model, dataloader, optimizer, scaler, device, accumulation_steps
                     torch.cuda.empty_cache()
                 print(f"\nWARNING: out of memory in batch {batch_idx}. Skipping batch.")
                 print_gpu_memory()
+                skipped_pairs += dataloader.batch_size
                 continue
             else:
                 raise e
+    
+    # Print epoch summary
+    print(f"\nEpoch {epoch + 1} Summary:")
+    print(f"Total pairs: {total_pairs}")
+    print(f"Skipped pairs: {skipped_pairs} ({skipped_pairs/total_pairs*100:.1f}%)")
+    print(f"Processed pairs: {total_pairs - skipped_pairs} ({(total_pairs - skipped_pairs)/total_pairs*100:.1f}%)")
     
     return total_loss / len(dataloader)
 
@@ -445,8 +442,8 @@ def main():
     
     # Create combined dataset
     print("\nLoading and combining datasets...")
-    train_none = MegaScenesDataset('metadata/train_none_megascenes_path.npy', mode="pad")
-    train_overlap = MegaScenesDataset('metadata/train_overlap_megascenes_path.npy', mode="pad")
+    train_none = MegaScenesDataset('metadata/train_none_megascenes_path_valid.npy', mode="pad")
+    train_overlap = MegaScenesDataset('metadata/train_overlap_megascenes_path_valid.npy', mode="pad")
     
     # Combine datasets
     combined_dataset = ConcatDataset([train_none, train_overlap])
