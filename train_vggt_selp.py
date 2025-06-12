@@ -398,7 +398,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     batch_size = 4
     num_epochs = 50
-    learning_rate = 1e-4
+    learning_rate = 5e-4
     accumulation_steps = 8
     num_workers = 2
     prefetch_factor = 2
@@ -470,9 +470,9 @@ def main():
     
     print(f"Created data loader with {len(train_loader)} batches")
     
-    # Initialize optimizer and scaler
+    # Initialize optimizer and scaler with adjusted parameters
     print("\nInitializing optimizer and scaler...")
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.05)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
     scaler = GradScaler()
     print("Optimizer and scaler initialized")
     
@@ -492,10 +492,10 @@ def main():
         print(f"Loss: {epoch_loss:.4f}")
         
         # Save checkpoint if loss improved
-        if epoch_loss < best_loss:
+        if epoch_loss < best_loss and epoch > 5:
             print(f"\nNew best loss: {epoch_loss:.4f} (previous: {best_loss:.4f})")
             best_loss = epoch_loss
-            print(f"Saving checkpoint for epoch {epoch+1}...")
+            print(f"Saving best checkpoint for epoch {epoch+1}...")
             checkpoint = {
                 'epoch': epoch,
                 'model': model.state_dict(),
@@ -503,7 +503,19 @@ def main():
                 'best_loss': best_loss,
             }
             torch.save(checkpoint, f'vggt_megascenes_best.pth')
-            print("Checkpoint saved successfully")
+            print("Best checkpoint saved successfully")
+        
+        # Save checkpoint every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            print(f"\nSaving periodic checkpoint for epoch {epoch+1}...")
+            checkpoint = {
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'loss': epoch_loss,
+            }
+            torch.save(checkpoint, f'vggt_megascenes_epoch_{epoch+1}.pth')
+            print("Periodic checkpoint saved successfully")
             
         # Clear cache after each epoch
         torch.cuda.empty_cache()
