@@ -34,13 +34,13 @@ def get_img_path(img_path, base_paths, categories):
                     # Try with original filename (with underscores)
                     candidate = os.path.join(base, *new_parts, filename)
                     if os.path.exists(candidate):
-                        return candidate
+                        return candidate, {scene_id: scene_name}
                     
                     # Try with spaces in filename
                     candidate = os.path.join(base, *new_parts, filename_with_spaces)
                     if os.path.exists(candidate):
-                        return candidate
-    return None
+                        return candidate, {scene_id: scene_name}
+    return None, None
 
 def filter_valid_pairs(input_npy, output_npy, base_paths, pbar=None):
     print(f"\nProcessing {input_npy}...")
@@ -56,6 +56,9 @@ def filter_valid_pairs(input_npy, output_npy, base_paths, pbar=None):
     # List to store invalid addresses
     invalid_addresses = []
     
+    # Dictionary to store scene ID to scene name mappings
+    scene_mappings = {}
+    
     print(f"Total pairs to check: {total_pairs}")
     
     # Create progress bar for this file
@@ -65,8 +68,8 @@ def filter_valid_pairs(input_npy, output_npy, base_paths, pbar=None):
                      leave=True)
     
     for key, pair_data in file_pbar:
-        img1_path = get_img_path(pair_data['img1']['path'], base_paths, categories)
-        img2_path = get_img_path(pair_data['img2']['path'], base_paths, categories)
+        img1_path, mapping1 = get_img_path(pair_data['img1']['path'], base_paths, categories)
+        img2_path, mapping2 = get_img_path(pair_data['img2']['path'], base_paths, categories)
         
         if img1_path is not None and img2_path is not None:
             # Create a copy of the pair data with full paths
@@ -75,6 +78,12 @@ def filter_valid_pairs(input_npy, output_npy, base_paths, pbar=None):
             valid_pair['img2']['path'] = img2_path
             valid_pairs[key] = valid_pair
             valid_count += 1
+            
+            # Update scene mappings
+            if mapping1:
+                scene_mappings.update(mapping1)
+            if mapping2:
+                scene_mappings.update(mapping2)
         else:
             if not pair_data['img1']['path'].startswith('images/') or not pair_data['img2']['path'].startswith('images/'):
                 invalid_path_format += 1
@@ -138,6 +147,14 @@ def filter_valid_pairs(input_npy, output_npy, base_paths, pbar=None):
             for addr in invalid_addresses:
                 f.write(addr + '\n\n')  # Add extra newline between entries
         print(f"\nSaved {len(invalid_addresses)} invalid addresses to invalid_addresses.txt")
+    
+    # Save scene mappings to file
+    if scene_mappings:
+        output_base = os.path.splitext(output_npy)[0]
+        with open(f'{output_base}_scene_mappings.txt', 'w') as f:
+            for scene_id, scene_name in sorted(scene_mappings.items()):
+                f.write(f"{scene_id} -> {scene_name}\n")
+        print(f"\nSaved {len(scene_mappings)} scene mappings to {output_base}_scene_mappings.txt")
     
     print(f"\nFiltering results for {input_npy}:")
     print(f"Total pairs: {total_pairs}")
