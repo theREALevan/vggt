@@ -28,7 +28,7 @@ def convert_heic_to_pil(heic_path):
         raise ImportError("pillow-heif is required")
 
 # Configuration
-IMAGE_FOLDER = '/home/yz864/vggt/images'   # folder of input images
+IMAGE_FOLDER = '/home/yz864/vggt/test_images/pair_1_1400'   # folder of input images
 OUT_GLTF     = os.path.join(IMAGE_FOLDER, 'scene.glb')  # output filename in images folder
 CONF_THRESH  = 50.0                       # point‐cloud confidence threshold
 
@@ -105,6 +105,25 @@ extrinsic_t, intrinsic_t = pose_encoding_to_extri_intri(
     predictions["pose_enc"],     # shape (1, S, 9)
     image_size_hw=(H, W)
 )
+
+# Print pose information
+print("\nDecoded pose_enc values:\n")
+for i, img_path in enumerate(image_paths):
+    img_name = os.path.basename(img_path)
+    print(f"Image {i+1} ({img_name}):")
+    
+    # Get pose encoding for this image
+    pose_enc = predictions["pose_enc"][0, i].cpu().numpy()
+    
+    # Print translation
+    print(f"  Translation (T): [{pose_enc[0]:.3f}, {pose_enc[1]:.3f}, {pose_enc[2]:.3f}]")
+    
+    # Print rotation quaternion
+    print(f"  Rotation (quat): [{pose_enc[3]:.3f}, {pose_enc[4]:.3f}, {pose_enc[5]:.3f}, {pose_enc[6]:.3f}]")
+    
+    # Print field of view
+    print(f"  Field of View:   [{pose_enc[7]:.3f}, {pose_enc[8]:.3f}]\n")
+
 # Convert to NumPy and drop the batch axis
 predictions["extrinsic"] = extrinsic_t.cpu().numpy().squeeze(0)  # (S, 3, 4)
 predictions["intrinsic"] = intrinsic_t.cpu().numpy().squeeze(0)  # (S, 3, 3)
