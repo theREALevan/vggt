@@ -282,8 +282,8 @@ def main(args):
                         # VGGT forward pass for this scene's image pair
                         preds = model(pair_imgs)  # Input: (2, 3, H, W) -> Output: dict with 'pose_enc'
                         
-                        # Save one pair every 100 pairs trained
-                        if batch_idx % 100 == 0 and i == 0:
+                        # Save one pair every 1000 pairs trained
+                        if batch_idx % 1000 == 0 and i == 0:
                             pair_dir = test_dir / f"pair_{epoch}_{batch_idx}"
                             pair_dir.mkdir(exist_ok=True)
                             
@@ -381,6 +381,23 @@ def main(args):
                         
                         # Compute geodesic distance between predicted and ground truth relative rotations
                         pair_loss = geodesic_loss(R_pred_rel, R_gt_rel)
+                        
+                        # Add penalties for first image's pose deviation from origin
+                        # Get first image's predicted translation and rotation
+                        t1_pred = extr[0, :3, 3]  # First image's translation
+                        R1_pred = extr[0, :3, :3]  # First image's rotation matrix
+                        
+                        # Create identity rotation matrix for reference
+                        R1_identity = torch.eye(3, device=device)
+                        
+                        # Penalty for first image's rotation deviation from identity
+                        R1_penalty = geodesic_loss(R1_pred.unsqueeze(0), R1_identity.unsqueeze(0))
+                        
+                        # Penalty for first image's translation deviation from zero
+                        t1_penalty = torch.norm(t1_pred)
+                        
+                        # Combine losses with weights
+                        pair_loss = pair_loss + 0.05 * (R1_penalty + t1_penalty)
                         
                         batch_losses.append(pair_loss)
                 
