@@ -145,9 +145,26 @@ def collate_fn(batch):
 
     # Preprocess images to tensor (2B, 3, H, W) - suppress shape warnings
     with SuppressWarnings():
-        # Load all images: paths1 + paths2 = [scene0_img1, scene1_img1, ..., scene0_img2, scene1_img2, ...]
-        # Result: (2B, 3, H, W) where 2B = total images from B scenes
-        imgs_all = load_and_preprocess_images(list(paths1) + list(paths2))
+        try:
+            # Load all images: paths1 + paths2 = [scene0_img1, scene1_img1, ..., scene0_img2, scene1_img2, ...]
+            # Result: (2B, 3, H, W) where 2B = total images from B scenes
+            imgs_all = load_and_preprocess_images(list(paths1) + list(paths2))
+        except OSError as e:
+            if "image file is truncated" in str(e):
+                # Find which image is truncated
+                for i, (p1, p2) in enumerate(zip(paths1, paths2)):
+                    try:
+                        Image.open(p1).convert("RGB")
+                    except OSError:
+                        print(f"\nTruncated image found: {p1}")
+                        raise
+                    try:
+                        Image.open(p2).convert("RGB")
+                    except OSError:
+                        print(f"\nTruncated image found: {p2}")
+                        raise
+            raise  # Re-raise if it's not a truncation error or if we couldn't identify the image
+
     B = len(batch)
     
     # Reshape to group image pairs by scene:
@@ -208,11 +225,14 @@ def main(args):
 
     # Create test_images directory
     test_dir = Path("/home/yz864/vggt/test_images")
+    if test_dir.exists():
+        shutil.rmtree(test_dir)
     test_dir.mkdir(parents=True, exist_ok=True)
     
     # Counter for saved pairs
     saved_pairs = 0
     nan_pair_saved = False
+    skipped_pairs = 0
 
     # Dataloader
     loader, n_overlap, n_none = create_loader(
@@ -245,194 +265,156 @@ def main(args):
         epoch_bar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch", leave=False)
 
         for batch_idx, (images, q1_gt, q2_gt, overlaps, paths) in enumerate(epoch_bar):
-            """
-            Training step for one batch of image pairs from different scenes.
-            
-            Input shapes:
-                images: (B, 2, 3, H, W) - B scenes, 2 images per scene, RGB, height, width
-                q1_gt: (B, 4) - ground truth quaternions for first image in each scene
-                q2_gt: (B, 4) - ground truth quaternions for second image in each scene
-                overlaps: List[str] - overlap categories for each scene
-                paths: List[Tuple[str, str]] - List of (path1, path2) tuples for each scene
-            """
-            images = images.to(device, non_blocking=True)
-            q1_gt = q1_gt.to(device)
-            q2_gt = q2_gt.to(device)
+            try:
+                images = images.to(device, non_blocking=True)
+                q1_gt = q1_gt.to(device)
+                q2_gt = q2_gt.to(device)
 
-            B = images.size(0)  # Number of scenes in this batch
-            
-            # Process each pair independently
-            batch_losses = []
-            for i in range(B):
-                # Extract one scene's image pair
-                pair_imgs = images[i]  # (2, 3, H, W) - 2 images from scene i, RGB, height, width
+                B = images.size(0)  # Number of scenes in this batch
                 
-                with torch.cuda.amp.autocast(dtype=amp_dtype):
-                    # VGGT forward pass for this scene's image pair
-                    preds = model(pair_imgs)  # Input: (2, 3, H, W) -> Output: dict with 'pose_enc'
+                # Process each pair independently
+                batch_losses = []
+                for i in range(B):
+                    # Extract one scene's image pair
+                    pair_imgs = images[i]  # (2, 3, H, W) - 2 images from scene i, RGB, height, width
                     
-                    # Save one pair every 100 pairs trained
-                    if batch_idx % 100 == 0 and i == 0:
-                        pair_dir = test_dir / f"pair_{epoch}_{batch_idx}"
-                        pair_dir.mkdir(exist_ok=True)
+                    with torch.cuda.amp.autocast(dtype=amp_dtype):
+                        # VGGT forward pass for this scene's image pair
+                        preds = model(pair_imgs)  # Input: (2, 3, H, W) -> Output: dict with 'pose_enc'
                         
-                        # Save images
-                        img1_path, img2_path = paths[i]
-                        shutil.copy2(img1_path, pair_dir / "img1.jpg")
-                        shutil.copy2(img2_path, pair_dir / "img2.jpg")
-                        
-                        # Save ground truth and predictions
-                        with open(pair_dir / "info.txt", "w") as f:
-                            f.write(f"Overlap type: {overlaps[i]}\n")
-                            f.write(f"GT quaternion 1: {q1_gt[i].cpu().numpy()}\n")
-                            f.write(f"GT quaternion 2: {q2_gt[i].cpu().numpy()}\n")
-                            
-                            # Decode and write pose_enc values in readable format
-                            pose_enc = preds["pose_enc"].cpu().detach().numpy()
-                            f.write("\nDecoded pose_enc values:\n\n")
-                            
-                            # Image 1
-                            f.write("Image 1 (img1.jpg):\n")
-                            f.write(f"  Translation (T): [{pose_enc[0, 0, 0]:.3f}, {pose_enc[0, 0, 1]:.3f}, {pose_enc[0, 0, 2]:.3f}]\n")
-                            f.write(f"  Rotation (quat): [{pose_enc[0, 0, 3]:.3f}, {pose_enc[0, 0, 4]:.3f}, {pose_enc[0, 0, 5]:.3f}, {pose_enc[0, 0, 6]:.3f}]\n")
-                            f.write(f"  Field of View:   [{pose_enc[0, 0, 7]:.3f}, {pose_enc[0, 0, 8]:.3f}]\n\n")
-                            
-                            # Image 2
-                            f.write("Image 2 (img2.jpg):\n")
-                            f.write(f"  Translation (T): [{pose_enc[0, 1, 0]:.3f}, {pose_enc[0, 1, 1]:.3f}, {pose_enc[0, 1, 2]:.3f}]\n")
-                            f.write(f"  Rotation (quat): [{pose_enc[0, 1, 3]:.3f}, {pose_enc[0, 1, 4]:.3f}, {pose_enc[0, 1, 5]:.3f}, {pose_enc[0, 1, 6]:.3f}]\n")
-                            f.write(f"  Field of View:   [{pose_enc[0, 1, 7]:.3f}, {pose_enc[0, 1, 8]:.3f}]\n")
-                        
-                        saved_pairs += 1
-                    
-                    # Check for NaN/Inf in predictions
-                    if torch.isnan(preds["pose_enc"]).any() or torch.isinf(preds["pose_enc"]).any():
-                        if not nan_pair_saved:
-                            nan_dir = test_dir / "nan_pair"
-                            nan_dir.mkdir(exist_ok=True)
+                        # Save one pair every 100 pairs trained
+                        if batch_idx % 100 == 0 and i == 0:
+                            pair_dir = test_dir / f"pair_{epoch}_{batch_idx}"
+                            pair_dir.mkdir(exist_ok=True)
                             
                             # Save images
                             img1_path, img2_path = paths[i]
-                            shutil.copy2(img1_path, nan_dir / "img1.jpg")
-                            shutil.copy2(img2_path, nan_dir / "img2.jpg")
+                            shutil.copy2(img1_path, pair_dir / "img1.jpg")
+                            shutil.copy2(img2_path, pair_dir / "img2.jpg")
                             
-                            # Save ground truth
-                            with open(nan_dir / "info.txt", "w") as f:
+                            # Save ground truth and predictions
+                            with open(pair_dir / "info.txt", "w") as f:
                                 f.write(f"Overlap type: {overlaps[i]}\n")
                                 f.write(f"GT quaternion 1: {q1_gt[i].cpu().numpy()}\n")
                                 f.write(f"GT quaternion 2: {q2_gt[i].cpu().numpy()}\n")
                                 
-                                # Try to decode and write pose_enc values if they're not all NaN/Inf
+                                # Decode and write pose_enc values in readable format
                                 pose_enc = preds["pose_enc"].cpu().detach().numpy()
-                                if not (np.isnan(pose_enc).all() or np.isinf(pose_enc).all()):
-                                    f.write("\nDecoded pose_enc values (partial):\n\n")
-                                    
-                                    # Image 1
-                                    f.write("Image 1 (img1.jpg):\n")
-                                    f.write(f"  Translation (T): [{pose_enc[0, 0, 0]:.3f}, {pose_enc[0, 0, 1]:.3f}, {pose_enc[0, 0, 2]:.3f}]\n")
-                                    f.write(f"  Rotation (quat): [{pose_enc[0, 0, 3]:.3f}, {pose_enc[0, 0, 4]:.3f}, {pose_enc[0, 0, 5]:.3f}, {pose_enc[0, 0, 6]:.3f}]\n")
-                                    f.write(f"  Field of View:   [{pose_enc[0, 0, 7]:.3f}, {pose_enc[0, 0, 8]:.3f}]\n\n")
-                                    
-                                    # Image 2
-                                    f.write("Image 2 (img2.jpg):\n")
-                                    f.write(f"  Translation (T): [{pose_enc[0, 1, 0]:.3f}, {pose_enc[0, 1, 1]:.3f}, {pose_enc[0, 1, 2]:.3f}]\n")
-                                    f.write(f"  Rotation (quat): [{pose_enc[0, 1, 3]:.3f}, {pose_enc[0, 1, 4]:.3f}, {pose_enc[0, 1, 5]:.3f}, {pose_enc[0, 1, 6]:.3f}]\n")
-                                    f.write(f"  Field of View:   [{pose_enc[0, 1, 7]:.3f}, {pose_enc[0, 1, 8]:.3f}]\n")
+                                f.write("\nDecoded pose_enc values:\n\n")
+                                
+                                # Image 1
+                                f.write("Image 1 (img1.jpg):\n")
+                                f.write(f"  Translation (T): [{pose_enc[0, 0, 0]:.3f}, {pose_enc[0, 0, 1]:.3f}, {pose_enc[0, 0, 2]:.3f}]\n")
+                                f.write(f"  Rotation (quat): [{pose_enc[0, 0, 3]:.3f}, {pose_enc[0, 0, 4]:.3f}, {pose_enc[0, 0, 5]:.3f}, {pose_enc[0, 0, 6]:.3f}]\n")
+                                f.write(f"  Field of View:   [{pose_enc[0, 0, 7]:.3f}, {pose_enc[0, 0, 8]:.3f}]\n\n")
+                                
+                                # Image 2
+                                f.write("Image 2 (img2.jpg):\n")
+                                f.write(f"  Translation (T): [{pose_enc[0, 1, 0]:.3f}, {pose_enc[0, 1, 1]:.3f}, {pose_enc[0, 1, 2]:.3f}]\n")
+                                f.write(f"  Rotation (quat): [{pose_enc[0, 1, 3]:.3f}, {pose_enc[0, 1, 4]:.3f}, {pose_enc[0, 1, 5]:.3f}, {pose_enc[0, 1, 6]:.3f}]\n")
+                                f.write(f"  Field of View:   [{pose_enc[0, 1, 7]:.3f}, {pose_enc[0, 1, 8]:.3f}]\n")
                             
-                            nan_pair_saved = True
+                            saved_pairs += 1
                         
-                        path1, path2 = paths[i]
-                        print(f"\nNaN/Inf detected in pose_enc for image pair:")
-                        print(f"  Image 1: {path1}")
-                        print(f"  Image 2: {path2}")
-                        print(f"  Overlap type: {overlaps[i]}")
-                        print(f"  GT quaternion 1: {q1_gt[i].cpu().numpy()}")
-                        print(f"  GT quaternion 2: {q2_gt[i].cpu().numpy()}")
-                        raise ValueError("NaN/Inf detected in pose_enc")
-                    
-                    # Get image dimensions for pose decoding
-                    H, W = pair_imgs.shape[-2:]
-                    
-                    # Decode pose encodings to extrinsic matrices
-                    # preds["pose_enc"]: (1, 2, 9) - 1 batch, 2 images, 9-dim pose encoding
-                    extr, _ = pose_encoding_to_extri_intri(preds["pose_enc"], (H, W))
-                    # extr: (1, 2, 3, 4) - 1 batch, 2 cameras, 3x4 extrinsic matrices [R|t]
-                    
-                    # Check for NaN/Inf in extrinsic matrices
-                    if torch.isnan(extr).any() or torch.isinf(extr).any():
-                        path1, path2 = paths[i]
-                        print(f"\nNaN/Inf detected in extrinsic matrices for image pair:")
-                        print(f"  Image 1: {path1}")
-                        print(f"  Image 2: {path2}")
-                        print(f"  Overlap type: {overlaps[i]}")
-                        print(f"  GT quaternion 1: {q1_gt[i].cpu().numpy()}")
-                        print(f"  GT quaternion 2: {q2_gt[i].cpu().numpy()}")
-                        raise ValueError("NaN/Inf detected in extrinsic matrices")
-                    
-                    # Remove batch dimension since we process one scene at a time
-                    extr = extr.squeeze(0)  # (1, 2, 3, 4) -> (2, 3, 4) - 2 cameras, 3x4 matrices
-                    
-                    # Extract 3x3 rotation matrices from 3x4 extrinsic matrices
-                    R_pred_pair = extr[:, :3, :3]  # (2, 3, 4) -> (2, 3, 3) - 2 rotation matrices
-                    
-                    # Convert ground truth quaternions to rotation matrices for this scene
-                    R1_gt_i = quat_to_rotmat(q1_gt[i:i+1])  # (1, 4) -> (1, 3, 3) - first image rotation
-                    R2_gt_i = quat_to_rotmat(q2_gt[i:i+1])  # (1, 4) -> (1, 3, 3) - second image rotation
-                    
-                    # Compute relative rotations: R_rel = R2 @ R1^T
-                    R1_pred = R_pred_pair[0]  # (3, 3) - first image predicted rotation
-                    R2_pred = R_pred_pair[1]  # (3, 3) - second image predicted rotation
-                    # Relative rotation: how to rotate from camera 1 to camera 2
-                    R_pred_rel = torch.matmul(R2_pred, R1_pred.transpose(-2, -1)).unsqueeze(0)  # (3,3) -> (1,3,3)
-                    R_gt_rel = torch.matmul(R2_gt_i, R1_gt_i.transpose(1, 2))  # (1,3,3) @ (1,3,3) -> (1,3,3)
-                    
-                    # Check for NaN/Inf in relative rotations
-                    if torch.isnan(R_pred_rel).any() or torch.isinf(R_pred_rel).any():
-                        path1, path2 = paths[i]
-                        print(f"\nNaN/Inf detected in relative rotations for image pair:")
-                        print(f"  Image 1: {path1}")
-                        print(f"  Image 2: {path2}")
-                        print(f"  Overlap type: {overlaps[i]}")
-                        print(f"  GT quaternion 1: {q1_gt[i].cpu().numpy()}")
-                        print(f"  GT quaternion 2: {q2_gt[i].cpu().numpy()}")
-                        raise ValueError("NaN/Inf detected in relative rotations")
-                    
-                    # Compute geodesic distance between predicted and ground truth relative rotations
-                    pair_loss = geodesic_loss(R_pred_rel, R_gt_rel)
-                    
-                    # Check for NaN/Inf in loss
-                    if torch.isnan(pair_loss) or torch.isinf(pair_loss):
-                        path1, path2 = paths[i]
-                        print(f"\nNaN/Inf detected in loss computation for image pair:")
-                        print(f"  Image 1: {path1}")
-                        print(f"  Image 2: {path2}")
-                        print(f"  Overlap type: {overlaps[i]}")
-                        print(f"  GT quaternion 1: {q1_gt[i].cpu().numpy()}")
-                        print(f"  GT quaternion 2: {q2_gt[i].cpu().numpy()}")
-                        raise ValueError("NaN/Inf detected in loss computation")
-                    
-                    batch_losses.append(pair_loss)
-            
-            # Average loss across all scenes in the batch
-            loss = torch.stack(batch_losses).mean()
+                        # Check for NaN/Inf in predictions
+                        if torch.isnan(preds["pose_enc"]).any() or torch.isinf(preds["pose_enc"]).any():
+                            if not nan_pair_saved:
+                                nan_dir = test_dir / "nan_pair"
+                                nan_dir.mkdir(exist_ok=True)
+                                
+                                # Save images
+                                img1_path, img2_path = paths[i]
+                                shutil.copy2(img1_path, nan_dir / "img1.jpg")
+                                shutil.copy2(img2_path, nan_dir / "img2.jpg")
+                                
+                                # Save ground truth
+                                with open(nan_dir / "info.txt", "w") as f:
+                                    f.write(f"Overlap type: {overlaps[i]}\n")
+                                    f.write(f"GT quaternion 1: {q1_gt[i].cpu().numpy()}\n")
+                                    f.write(f"GT quaternion 2: {q2_gt[i].cpu().numpy()}\n")
+                                    
+                                    # Try to decode and write pose_enc values if they're not all NaN/Inf
+                                    pose_enc = preds["pose_enc"].cpu().detach().numpy()
+                                    if not (np.isnan(pose_enc).all() or np.isinf(pose_enc).all()):
+                                        f.write("\nDecoded pose_enc values (partial):\n\n")
+                                        
+                                        # Image 1
+                                        f.write("Image 1 (img1.jpg):\n")
+                                        f.write(f"  Translation (T): [{pose_enc[0, 0, 0]:.3f}, {pose_enc[0, 0, 1]:.3f}, {pose_enc[0, 0, 2]:.3f}]\n")
+                                        f.write(f"  Rotation (quat): [{pose_enc[0, 0, 3]:.3f}, {pose_enc[0, 0, 4]:.3f}, {pose_enc[0, 0, 5]:.3f}, {pose_enc[0, 0, 6]:.3f}]\n")
+                                        f.write(f"  Field of View:   [{pose_enc[0, 0, 7]:.3f}, {pose_enc[0, 0, 8]:.3f}]\n\n")
+                                        
+                                        # Image 2
+                                        f.write("Image 2 (img2.jpg):\n")
+                                        f.write(f"  Translation (T): [{pose_enc[0, 1, 0]:.3f}, {pose_enc[0, 1, 1]:.3f}, {pose_enc[0, 1, 2]:.3f}]\n")
+                                        f.write(f"  Rotation (quat): [{pose_enc[0, 1, 3]:.3f}, {pose_enc[0, 1, 4]:.3f}, {pose_enc[0, 1, 5]:.3f}, {pose_enc[0, 1, 6]:.3f}]\n")
+                                        f.write(f"  Field of View:   [{pose_enc[0, 1, 7]:.3f}, {pose_enc[0, 1, 8]:.3f}]\n")
+                                
+                                nan_pair_saved = True
+                                
+                            raise ValueError("NaN/Inf detected in pose_enc")
+                        
+                        # Get image dimensions for pose decoding
+                        H, W = pair_imgs.shape[-2:]
+                        
+                        # Decode pose encodings to extrinsic matrices
+                        # preds["pose_enc"]: (1, 2, 9) - 1 batch, 2 images, 9-dim pose encoding
+                        extr, _ = pose_encoding_to_extri_intri(preds["pose_enc"], (H, W))
+                        # extr: (1, 2, 3, 4) - 1 batch, 2 cameras, 3x4 extrinsic matrices [R|t]
+                        
+                        # Remove batch dimension since we process one scene at a time
+                        extr = extr.squeeze(0)  # (1, 2, 3, 4) -> (2, 3, 4) - 2 cameras, 3x4 matrices
+                        
+                        # Extract 3x3 rotation matrices from 3x4 extrinsic matrices
+                        R_pred_pair = extr[:, :3, :3]  # (2, 3, 4) -> (2, 3, 3) - 2 rotation matrices
+                        
+                        # Convert ground truth quaternions to rotation matrices for this scene
+                        R1_gt_i = quat_to_rotmat(q1_gt[i:i+1])  # (1, 4) -> (1, 3, 3) - first image rotation
+                        R2_gt_i = quat_to_rotmat(q2_gt[i:i+1])  # (1, 4) -> (1, 3, 3) - second image rotation
+                        
+                        # Compute relative rotations: R_rel = R2 @ R1^T
+                        R1_pred = R_pred_pair[0]  # (3, 3) - first image predicted rotation
+                        R2_pred = R_pred_pair[1]  # (3, 3) - second image predicted rotation
+                        # Relative rotation: how to rotate from camera 1 to camera 2
+                        R_pred_rel = torch.matmul(R2_pred, R1_pred.transpose(-2, -1)).unsqueeze(0)  # (3,3) -> (1,3,3)
+                        R_gt_rel = torch.matmul(R2_gt_i, R1_gt_i.transpose(1, 2))  # (1,3,3) @ (1,3,3) -> (1,3,3)
+                        
+                        # Compute geodesic distance between predicted and ground truth relative rotations
+                        pair_loss = geodesic_loss(R_pred_rel, R_gt_rel)
+                        
+                        batch_losses.append(pair_loss)
+                
+                # Average loss across all scenes in the batch
+                loss = torch.stack(batch_losses).mean()
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
-            running_loss += loss.item() * B
-            # Update progress bar with current batch loss and running average
-            current_avg_loss = running_loss / ((epoch_bar.n + 1) * args.batch_size)
-            epoch_bar.set_postfix({
-                'batch_loss': f'{loss.item():.3f}',
-                'avg_loss': f'{current_avg_loss:.3f}'
-            })
+                running_loss += loss.item() * B
+                # Update progress bar with current batch loss and running average
+                current_avg_loss = running_loss / ((epoch_bar.n + 1) * args.batch_size)
+                epoch_bar.set_postfix({
+                    'batch_loss': f'{loss.item():.3f}',
+                    'avg_loss': f'{current_avg_loss:.3f}',
+                    'skipped': skipped_pairs
+                })
+
+            except OSError as e:
+                if "image file is truncated" in str(e):
+                    skipped_pairs += 1
+                    print(f"\nSkipping corrupted image pair. Total skipped: {skipped_pairs}")
+                    continue
+                raise  # Re-raise if it's not a truncation error
 
         epoch_bar.close()
 
         mean_loss = running_loss / (len(loader) * args.batch_size)
-        outer_bar.set_postfix(mean_loss=f"{mean_loss:.3f} rad / {(mean_loss*180/np.pi):.2f} deg")
+        outer_bar.set_postfix({
+            'mean_loss': f"{mean_loss:.3f} rad / {(mean_loss*180/np.pi):.2f} deg",
+            'skipped': skipped_pairs
+        })
 
         # Checkpoint
         if args.out_ckpt:
