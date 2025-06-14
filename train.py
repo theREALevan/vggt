@@ -136,6 +136,7 @@ def collate_fn(batch):
         q1: (B, 4) - quaternions for first image in each scene (w,x,y,z)
         q2: (B, 4) - quaternions for second image in each scene (w,x,y,z)
         overlaps: List[str] - overlap categories for each scene
+        paths: List[Tuple[str, str]] - List of (path1, path2) tuples for each scene
     """
     
     # Unzip the batch into separate lists
@@ -158,7 +159,10 @@ def collate_fn(batch):
     q1 = torch.stack(q1_list)  # (B, 4) - first image quaternions for B scenes
     q2 = torch.stack(q2_list)  # (B, 4) - second image quaternions for B scenes
     
-    return imgs_all, q1, q2, overlaps
+    # Create list of path pairs
+    paths = list(zip(paths1, paths2))
+    
+    return imgs_all, q1, q2, overlaps, paths
 
 ################################################################################
 # Training utilities
@@ -231,7 +235,7 @@ def main(args):
         running_loss = 0.0
         epoch_bar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch", leave=False)
 
-        for images, q1_gt, q2_gt, _ in epoch_bar:
+        for images, q1_gt, q2_gt, overlaps, paths in epoch_bar:
             """
             Training step for one batch of image pairs from different scenes.
             
@@ -239,6 +243,8 @@ def main(args):
                 images: (B, 2, 3, H, W) - B scenes, 2 images per scene, RGB, height, width
                 q1_gt: (B, 4) - ground truth quaternions for first image in each scene
                 q2_gt: (B, 4) - ground truth quaternions for second image in each scene
+                overlaps: List[str] - overlap categories for each scene
+                paths: List[Tuple[str, str]] - List of (path1, path2) tuples for each scene
             """
             images = images.to(device, non_blocking=True)
             q1_gt = q1_gt.to(device)
@@ -256,6 +262,17 @@ def main(args):
                     # VGGT forward pass for this scene's image pair
                     preds = model(pair_imgs)  # Input: (2, 3, H, W) -> Output: dict with 'pose_enc'
                     
+                    # Check for NaN/Inf in predictions
+                    if torch.isnan(preds["pose_enc"]).any() or torch.isinf(preds["pose_enc"]).any():
+                        path1, path2 = paths[i]
+                        print(f"\nNaN/Inf detected in pose_enc for image pair:")
+                        print(f"  Image 1: {path1}")
+                        print(f"  Image 2: {path2}")
+                        print(f"  Overlap type: {overlaps[i]}")
+                        print(f"  GT quaternion 1: {q1_gt[i].cpu().numpy()}")
+                        print(f"  GT quaternion 2: {q2_gt[i].cpu().numpy()}")
+                        raise ValueError("NaN/Inf detected in pose_enc")
+                    
                     # Get image dimensions for pose decoding
                     H, W = pair_imgs.shape[-2:]
                     
@@ -263,6 +280,17 @@ def main(args):
                     # preds["pose_enc"]: (1, 2, 9) - 1 batch, 2 images, 9-dim pose encoding
                     extr, _ = pose_encoding_to_extri_intri(preds["pose_enc"], (H, W))
                     # extr: (1, 2, 3, 4) - 1 batch, 2 cameras, 3x4 extrinsic matrices [R|t]
+                    
+                    # Check for NaN/Inf in extrinsic matrices
+                    if torch.isnan(extr).any() or torch.isinf(extr).any():
+                        path1, path2 = paths[i]
+                        print(f"\nNaN/Inf detected in extrinsic matrices for image pair:")
+                        print(f"  Image 1: {path1}")
+                        print(f"  Image 2: {path2}")
+                        print(f"  Overlap type: {overlaps[i]}")
+                        print(f"  GT quaternion 1: {q1_gt[i].cpu().numpy()}")
+                        print(f"  GT quaternion 2: {q2_gt[i].cpu().numpy()}")
+                        raise ValueError("NaN/Inf detected in extrinsic matrices")
                     
                     # Remove batch dimension since we process one scene at a time
                     extr = extr.squeeze(0)  # (1, 2, 3, 4) -> (2, 3, 4) - 2 cameras, 3x4 matrices
@@ -281,8 +309,31 @@ def main(args):
                     R_pred_rel = torch.matmul(R2_pred, R1_pred.transpose(-2, -1)).unsqueeze(0)  # (3,3) -> (1,3,3)
                     R_gt_rel = torch.matmul(R2_gt_i, R1_gt_i.transpose(1, 2))  # (1,3,3) @ (1,3,3) -> (1,3,3)
                     
+                    # Check for NaN/Inf in relative rotations
+                    if torch.isnan(R_pred_rel).any() or torch.isinf(R_pred_rel).any():
+                        path1, path2 = paths[i]
+                        print(f"\nNaN/Inf detected in relative rotations for image pair:")
+                        print(f"  Image 1: {path1}")
+                        print(f"  Image 2: {path2}")
+                        print(f"  Overlap type: {overlaps[i]}")
+                        print(f"  GT quaternion 1: {q1_gt[i].cpu().numpy()}")
+                        print(f"  GT quaternion 2: {q2_gt[i].cpu().numpy()}")
+                        raise ValueError("NaN/Inf detected in relative rotations")
+                    
                     # Compute geodesic distance between predicted and ground truth relative rotations
                     pair_loss = geodesic_loss(R_pred_rel, R_gt_rel)
+                    
+                    # Check for NaN/Inf in loss
+                    if torch.isnan(pair_loss) or torch.isinf(pair_loss):
+                        path1, path2 = paths[i]
+                        print(f"\nNaN/Inf detected in loss computation for image pair:")
+                        print(f"  Image 1: {path1}")
+                        print(f"  Image 2: {path2}")
+                        print(f"  Overlap type: {overlaps[i]}")
+                        print(f"  GT quaternion 1: {q1_gt[i].cpu().numpy()}")
+                        print(f"  GT quaternion 2: {q2_gt[i].cpu().numpy()}")
+                        raise ValueError("NaN/Inf detected in loss computation")
+                    
                     batch_losses.append(pair_loss)
             
             # Average loss across all scenes in the batch
