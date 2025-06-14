@@ -244,7 +244,7 @@ def main(args):
         running_loss = 0.0
         epoch_bar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch", leave=False)
 
-        for images, q1_gt, q2_gt, overlaps, paths in epoch_bar:
+        for batch_idx, (images, q1_gt, q2_gt, overlaps, paths) in enumerate(epoch_bar):
             """
             Training step for one batch of image pairs from different scenes.
             
@@ -271,9 +271,9 @@ def main(args):
                     # VGGT forward pass for this scene's image pair
                     preds = model(pair_imgs)  # Input: (2, 3, H, W) -> Output: dict with 'pose_enc'
                     
-                    # Save first 5 pairs and their predictions
-                    if saved_pairs < 5:
-                        pair_dir = test_dir / str(saved_pairs + 1)
+                    # Save one pair every 100 pairs trained
+                    if batch_idx % 100 == 0 and i == 0:
+                        pair_dir = test_dir / f"pair_{epoch}_{batch_idx}"
                         pair_dir.mkdir(exist_ok=True)
                         
                         # Save images
