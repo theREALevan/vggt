@@ -375,7 +375,7 @@ def parse_args():
     p.add_argument("--overlap-npy", type=str, default="metadata/train_overlap_megascenes_path_valid.npy")
     p.add_argument("--none-npy", type=str, default="metadata/train_none_megascenes_path_valid.npy")
     p.add_argument("--epochs", type=int, default=6)
-    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--num-workers", type=int, default=1)
     p.add_argument("--upweight-none", type=float, default=1.0, help="Sampling weight multiplier for 'none' overlap class.")
