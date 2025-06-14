@@ -8,6 +8,7 @@ import warnings
 import sys
 from contextlib import redirect_stdout
 from io import StringIO
+import shutil
 
 import torch
 import numpy as np
@@ -205,6 +206,14 @@ def main(args):
         else torch.float16
     )
 
+    # Create test_images directory
+    test_dir = Path("/home/yz864/vggt/test_images")
+    test_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Counter for saved pairs
+    saved_pairs = 0
+    nan_pair_saved = False
+
     # Dataloader
     loader, n_overlap, n_none = create_loader(
         args.overlap_npy,
@@ -262,8 +271,76 @@ def main(args):
                     # VGGT forward pass for this scene's image pair
                     preds = model(pair_imgs)  # Input: (2, 3, H, W) -> Output: dict with 'pose_enc'
                     
+                    # Save first 5 pairs and their predictions
+                    if saved_pairs < 5:
+                        pair_dir = test_dir / str(saved_pairs + 1)
+                        pair_dir.mkdir(exist_ok=True)
+                        
+                        # Save images
+                        img1_path, img2_path = paths[i]
+                        shutil.copy2(img1_path, pair_dir / "img1.jpg")
+                        shutil.copy2(img2_path, pair_dir / "img2.jpg")
+                        
+                        # Save ground truth and predictions
+                        with open(pair_dir / "info.txt", "w") as f:
+                            f.write(f"Overlap type: {overlaps[i]}\n")
+                            f.write(f"GT quaternion 1: {q1_gt[i].cpu().numpy()}\n")
+                            f.write(f"GT quaternion 2: {q2_gt[i].cpu().numpy()}\n")
+                            
+                            # Decode and write pose_enc values in readable format
+                            pose_enc = preds["pose_enc"].cpu().detach().numpy()
+                            f.write("\nDecoded pose_enc values:\n\n")
+                            
+                            # Image 1
+                            f.write("Image 1 (img1.jpg):\n")
+                            f.write(f"  Translation (T): [{pose_enc[0, 0, 0]:.3f}, {pose_enc[0, 0, 1]:.3f}, {pose_enc[0, 0, 2]:.3f}]\n")
+                            f.write(f"  Rotation (quat): [{pose_enc[0, 0, 3]:.3f}, {pose_enc[0, 0, 4]:.3f}, {pose_enc[0, 0, 5]:.3f}, {pose_enc[0, 0, 6]:.3f}]\n")
+                            f.write(f"  Field of View:   [{pose_enc[0, 0, 7]:.3f}, {pose_enc[0, 0, 8]:.3f}]\n\n")
+                            
+                            # Image 2
+                            f.write("Image 2 (img2.jpg):\n")
+                            f.write(f"  Translation (T): [{pose_enc[0, 1, 0]:.3f}, {pose_enc[0, 1, 1]:.3f}, {pose_enc[0, 1, 2]:.3f}]\n")
+                            f.write(f"  Rotation (quat): [{pose_enc[0, 1, 3]:.3f}, {pose_enc[0, 1, 4]:.3f}, {pose_enc[0, 1, 5]:.3f}, {pose_enc[0, 1, 6]:.3f}]\n")
+                            f.write(f"  Field of View:   [{pose_enc[0, 1, 7]:.3f}, {pose_enc[0, 1, 8]:.3f}]\n")
+                        
+                        saved_pairs += 1
+                    
                     # Check for NaN/Inf in predictions
                     if torch.isnan(preds["pose_enc"]).any() or torch.isinf(preds["pose_enc"]).any():
+                        if not nan_pair_saved:
+                            nan_dir = test_dir / "nan_pair"
+                            nan_dir.mkdir(exist_ok=True)
+                            
+                            # Save images
+                            img1_path, img2_path = paths[i]
+                            shutil.copy2(img1_path, nan_dir / "img1.jpg")
+                            shutil.copy2(img2_path, nan_dir / "img2.jpg")
+                            
+                            # Save ground truth
+                            with open(nan_dir / "info.txt", "w") as f:
+                                f.write(f"Overlap type: {overlaps[i]}\n")
+                                f.write(f"GT quaternion 1: {q1_gt[i].cpu().numpy()}\n")
+                                f.write(f"GT quaternion 2: {q2_gt[i].cpu().numpy()}\n")
+                                
+                                # Try to decode and write pose_enc values if they're not all NaN/Inf
+                                pose_enc = preds["pose_enc"].cpu().detach().numpy()
+                                if not (np.isnan(pose_enc).all() or np.isinf(pose_enc).all()):
+                                    f.write("\nDecoded pose_enc values (partial):\n\n")
+                                    
+                                    # Image 1
+                                    f.write("Image 1 (img1.jpg):\n")
+                                    f.write(f"  Translation (T): [{pose_enc[0, 0, 0]:.3f}, {pose_enc[0, 0, 1]:.3f}, {pose_enc[0, 0, 2]:.3f}]\n")
+                                    f.write(f"  Rotation (quat): [{pose_enc[0, 0, 3]:.3f}, {pose_enc[0, 0, 4]:.3f}, {pose_enc[0, 0, 5]:.3f}, {pose_enc[0, 0, 6]:.3f}]\n")
+                                    f.write(f"  Field of View:   [{pose_enc[0, 0, 7]:.3f}, {pose_enc[0, 0, 8]:.3f}]\n\n")
+                                    
+                                    # Image 2
+                                    f.write("Image 2 (img2.jpg):\n")
+                                    f.write(f"  Translation (T): [{pose_enc[0, 1, 0]:.3f}, {pose_enc[0, 1, 1]:.3f}, {pose_enc[0, 1, 2]:.3f}]\n")
+                                    f.write(f"  Rotation (quat): [{pose_enc[0, 1, 3]:.3f}, {pose_enc[0, 1, 4]:.3f}, {pose_enc[0, 1, 5]:.3f}, {pose_enc[0, 1, 6]:.3f}]\n")
+                                    f.write(f"  Field of View:   [{pose_enc[0, 1, 7]:.3f}, {pose_enc[0, 1, 8]:.3f}]\n")
+                            
+                            nan_pair_saved = True
+                        
                         path1, path2 = paths[i]
                         print(f"\nNaN/Inf detected in pose_enc for image pair:")
                         print(f"  Image 1: {path1}")
